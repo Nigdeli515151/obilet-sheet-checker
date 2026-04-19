@@ -128,12 +128,12 @@ async function createPage(context) {
   return page;
 }
 
-async function waitForJourneyJson(page, originId, destinationId, dateStr) {
+async function waitForJourneyJson(page, originId, destinationId, dateStr, timeoutMs) {
   const targetPart = `/json/journeys/${originId}-${destinationId}/${dateStr}`;
 
   const response = await page.waitForResponse(
     (resp) => resp.url().includes(targetPart) && resp.status() === 200,
-    { timeout: RESPONSE_TIMEOUT_MS }
+    { timeout: timeoutMs }
   );
 
   const json = await response.json();
@@ -145,70 +145,139 @@ async function waitForJourneyJson(page, originId, destinationId, dateStr) {
   };
 }
 
-async function fetchJourneysWithOnePage(page, originId, destinationId, dateStr) {
+async function pageFetchJson(page, originId, destinationId, dateStr) {
+  return await page.evaluate(async ({ originId, destinationId, dateStr }) => {
+    const url = `/json/journeys/${originId}-${destinationId}/${dateStr}`;
+    const res = await fetch(url, {
+      method: "GET",
+      headers: {
+        "accept": "application/json, text/plain, */*"
+      },
+      credentials: "include"
+    });
+
+    const text = await res.text();
+    return {
+      ok: res.ok,
+      status: res.status,
+      url: res.url,
+      text
+    };
+  }, { originId, destinationId, dateStr });
+}
+
+async function fetchJourneysRobust(page, context, originId, destinationId, dateStr, logger) {
   const pageUrl = `https://www.obilet.com/seferler/${originId}-${destinationId}/${dateStr}`;
 
-  const waitJsonPromise = waitForJourneyJson(page, originId, destinationId, dateStr);
+  logger("sayfa aciliyor");
+  const waitJsonPromise = waitForJourneyJson(page, originId, destinationId, dateStr, RESPONSE_TIMEOUT_MS);
 
   await page.goto(pageUrl, {
     waitUntil: "domcontentloaded",
     timeout: PAGE_TIMEOUT_MS
   });
 
-  let result;
   try {
-    result = await waitJsonPromise;
-  } catch (firstErr) {
-    const fallback = await page.evaluate(async ({ originId, destinationId, dateStr }) => {
-      const url = `/json/journeys/${originId}-${destinationId}/${dateStr}`;
-      const res = await fetch(url, {
-        method: "GET",
-        headers: {
-          "accept": "application/json, text/plain, */*"
-        },
-        credentials: "include"
-      });
+    const result = await waitJsonPromise;
+    return {
+      pageUrl,
+      jsonUrl: result.url,
+      journeys: result.journeys,
+      statusText: "OK"
+    };
+  } catch (err1) {
+    logger("ilk response bekleme basarisiz, sayfada ekstra bekleniyor");
+  }
 
-      const text = await res.text();
-      return {
-        ok: res.ok,
-        status: res.status,
-        url: res.url,
-        text
-      };
-    }, { originId, destinationId, dateStr });
+  await page.waitForTimeout(5000);
 
-    if (!fallback.ok) {
-      throw new Error(`JSON yakalanamadi. Fallback HTTP ${fallback.status}`);
-    }
+  try {
+    const lateResult = await waitForJourneyJson(page, originId, destinationId, dateStr, 7000);
+    return {
+      pageUrl,
+      jsonUrl: lateResult.url,
+      journeys: lateResult.journeys,
+      statusText: "Gec geldi ama alindi"
+    };
+  } catch (err2) {
+    logger("gec response da gelmedi, sayfa ici fetch deneniyor");
+  }
 
+  const fallback = await pageFetchJson(page, originId, destinationId, dateStr);
+
+  if (fallback.ok) {
     const parsed = JSON.parse(fallback.text);
-    result = {
-      url: fallback.url,
-      journeys: Array.isArray(parsed.journeys) ? parsed.journeys : []
+    return {
+      pageUrl,
+      jsonUrl: fallback.url,
+      journeys: Array.isArray(parsed.journeys) ? parsed.journeys : [],
+      statusText: "Sayfa ici fetch ile alindi"
     };
   }
 
-  return {
-    pageUrl,
-    jsonUrl: result.url,
-    journeys: result.journeys
-  };
+  logger(`sayfa ici fetch basarisiz: HTTP ${fallback.status}, yeni sekme deneniyor`);
+
+  const retryPage = await createPage(context);
+  try {
+    const retryWaitPromise = waitForJourneyJson(retryPage, originId, destinationId, dateStr, RESPONSE_TIMEOUT_MS);
+    await retryPage.goto(pageUrl, {
+      waitUntil: "domcontentloaded",
+      timeout: PAGE_TIMEOUT_MS
+    });
+
+    try {
+      const retryResult = await retryWaitPromise;
+      return {
+        pageUrl,
+        jsonUrl: retryResult.url,
+        journeys: retryResult.journeys,
+        statusText: "Yeniden denemede alindi"
+      };
+    } catch (err3) {
+      logger("yeni sekmede de response bekleme basarisiz, sayfa ici fetch tekrar deneniyor");
+    }
+
+    await retryPage.waitForTimeout(4000);
+
+    const retryFallback = await pageFetchJson(retryPage, originId, destinationId, dateStr);
+
+    if (retryFallback.ok) {
+      const retryParsed = JSON.parse(retryFallback.text);
+      return {
+        pageUrl,
+        jsonUrl: retryFallback.url,
+        journeys: Array.isArray(retryParsed.journeys) ? retryParsed.journeys : [],
+        statusText: "Yeniden deneme sayfa ici fetch ile alindi"
+      };
+    }
+
+    if (retryFallback.status === 403) {
+      throw new Error("Engellendi | HTTP 403");
+    }
+
+    if (retryFallback.status === 404) {
+      throw new Error("Bulunamadi | HTTP 404");
+    }
+
+    throw new Error(`JSON alinamadi | HTTP ${retryFallback.status}`);
+  } finally {
+    await retryPage.close();
+  }
 }
 
-async function fetchJourneysWithRetry(page, originId, destinationId, dateStr, logger) {
+async function fetchJourneysWithRetry(page, context, originId, destinationId, dateStr, logger) {
   let lastError = null;
 
   for (let attempt = 1; attempt <= RETRY_COUNT; attempt++) {
     try {
       logger(`deneme ${attempt} basladi`);
-      const data = await fetchJourneysWithOnePage(page, originId, destinationId, dateStr);
+      const data = await fetchJourneysRobust(page, context, originId, destinationId, dateStr, logger);
       logger(`deneme ${attempt} basarili`);
       return data;
     } catch (err) {
       lastError = err;
       logger(`deneme ${attempt} hata: ${String(err.message || err)}`);
-      await page.waitForTimeout(1000 * attempt);
+      await page.waitForTimeout(1500 * attempt);
     }
   }
 
@@ -345,6 +414,7 @@ async function main() {
 
   async function worker(workerId) {
     const page = pages[workerId];
+    const context = contexts[workerId];
 
     while (true) {
       const currentIndex = cursor;
@@ -383,8 +453,9 @@ async function main() {
         await setDebug("Basladi", 0);
 
         const logger = (msg) => console.log(`${logPrefix} -> ${msg}`);
-        const { jsonUrl, journeys } = await fetchJourneysWithRetry(
+        const { jsonUrl, journeys, statusText } = await fetchJourneysWithRetry(
           page,
+          context,
           originId,
           destinationId,
           tarih,
@@ -392,7 +463,7 @@ async function main() {
         );
 
         const normalized = normalizeJourneys(journeys);
-        await setDebug(`OK | ${jsonUrl}`, normalized.length);
+        await setDebug(`${statusText} | ${jsonUrl}`, normalized.length);
 
         for (const item of normalized) {
           if (item.price < referansFiyat) {
@@ -414,7 +485,7 @@ async function main() {
         await setDebug(`Hata | ${String(err.message || err)}`, 0);
       }
 
-      await page.waitForTimeout(500);
+      await page.waitForTimeout(700);
     }
   }
 
