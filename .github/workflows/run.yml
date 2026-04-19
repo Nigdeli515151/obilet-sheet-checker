@@ -3,7 +3,6 @@ name: Obilet Sheet Check
 on:
   workflow_dispatch:
 
-
 jobs:
   run-check:
     runs-on: ubuntu-latest
@@ -27,4 +26,6 @@ jobs:
         env:
           SHEET_ID: ${{ secrets.SHEET_ID }}
           GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: npm start
