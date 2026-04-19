@@ -3,6 +3,10 @@ name: Obilet Sheet Check
 on:
   workflow_dispatch:
 
+concurrency:
+  group: obilet-sheet-check
+  cancel-in-progress: false
+
 jobs:
   run-check:
     runs-on: ubuntu-latest
