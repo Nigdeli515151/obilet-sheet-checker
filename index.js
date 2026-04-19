@@ -18,20 +18,16 @@ function getTomorrowDateTR() {
 
 function parseGoogleCredentials() {
   const raw = process.env.GOOGLE_CREDENTIALS_JSON;
-  if (!raw) {
-    throw new Error("GOOGLE_CREDENTIALS_JSON eksik.");
-  }
+  if (!raw) throw new Error("GOOGLE_CREDENTIALS_JSON eksik.");
   return JSON.parse(raw);
 }
 
 async function getSheetsClient() {
   const credentials = parseGoogleCredentials();
-
   const auth = new google.auth.GoogleAuth({
     credentials,
     scopes: ["https://www.googleapis.com/auth/spreadsheets"]
   });
-
   return google.sheets({ version: "v4", auth });
 }
 
@@ -53,7 +49,7 @@ async function readRoutes(sheets) {
 
 async function writeResults(sheets, rows) {
   const values = [
-    ["Kalkis", "Varis", "Tarih", "Firma", "ObiletFiyati", "ReferansFiyat", "Fark", "JsonLink"],
+    ["Kalkis", "Varis", "Tarih", "Firma", "ObiletFiyati", "ReferansFiyat", "Fark", "Kaynak"],
     ...rows
   ];
 
@@ -72,7 +68,7 @@ async function writeResults(sheets, rows) {
 
 async function writeDebug(sheets, rows) {
   const values = [
-    ["Varis", "VarisID", "ReferansFiyat", "JsonLink", "SeferSayisi", "Durum"],
+    ["Varis", "VarisID", "ReferansFiyat", "SayfaURL", "SeferSayisi", "Durum"],
     ...rows
   ];
 
@@ -87,42 +83,6 @@ async function writeDebug(sheets, rows) {
     valueInputOption: "RAW",
     requestBody: { values }
   });
-}
-
-async function fetchJourneysForRoute(page, destinationId, dateStr) {
-  const pageUrl = `https://www.obilet.com/seferler/${NIGDE_ID}-${destinationId}/${dateStr}`;
-  const jsonUrl = `https://www.obilet.com/json/journeys/${NIGDE_ID}-${destinationId}/${dateStr}`;
-
-  await page.goto(pageUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
-
-  const data = await page.evaluate(async (url) => {
-    const res = await fetch(url, {
-      method: "GET",
-      headers: {
-        "accept": "application/json, text/plain, */*"
-      },
-      credentials: "include"
-    });
-
-    const text = await res.text();
-    return {
-      ok: res.ok,
-      status: res.status,
-      text
-    };
-  }, jsonUrl);
-
-  if (!data.ok) {
-    throw new Error(`HTTP ${data.status}`);
-  }
-
-  const parsed = JSON.parse(data.text);
-  const journeys = Array.isArray(parsed.journeys) ? parsed.journeys : [];
-
-  return {
-    jsonUrl,
-    journeys
-  };
 }
 
 function normalizeJourneys(journeys) {
@@ -145,19 +105,54 @@ function normalizeJourneys(journeys) {
   return out;
 }
 
+async function waitForJourneyJson(page, originId, destinationId, dateStr) {
+  const targetPart = `/json/journeys/${originId}-${destinationId}/${dateStr}`;
+
+  const response = await page.waitForResponse(
+    async (resp) => {
+      const url = resp.url();
+      return url.includes(targetPart) && resp.status() === 200;
+    },
+    { timeout: 30000 }
+  );
+
+  const json = await response.json();
+  const journeys = Array.isArray(json.journeys) ? json.journeys : [];
+
+  return {
+    url: response.url(),
+    journeys
+  };
+}
+
+async function fetchJourneysForRoute(page, destinationId, dateStr) {
+  const pageUrl = `https://www.obilet.com/seferler/${NIGDE_ID}-${destinationId}/${dateStr}`;
+
+  const waitJsonPromise = waitForJourneyJson(page, NIGDE_ID, destinationId, dateStr);
+
+  await page.goto(pageUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
+
+  const result = await waitJsonPromise;
+  return {
+    pageUrl,
+    jsonUrl: result.url,
+    journeys: result.journeys
+  };
+}
+
 async function main() {
-  if (!SHEET_ID) {
-    throw new Error("SHEET_ID eksik.");
-  }
+  if (!SHEET_ID) throw new Error("SHEET_ID eksik.");
 
   const sheets = await getSheetsClient();
   const routes = await readRoutes(sheets);
   const tarih = getTomorrowDateTR();
 
   const browser = await chromium.launch({ headless: true });
-  const page = await browser.newPage({
-    locale: "tr-TR"
+  const context = await browser.newContext({
+    locale: "tr-TR",
+    userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
   });
+  const page = await context.newPage();
 
   const resultRows = [];
   const debugRows = [];
@@ -171,10 +166,10 @@ async function main() {
     }
 
     try {
-      const { jsonUrl, journeys } = await fetchJourneysForRoute(page, varisId, tarih);
+      const { pageUrl, jsonUrl, journeys } = await fetchJourneysForRoute(page, varisId, tarih);
       const normalized = normalizeJourneys(journeys);
 
-      debugRows.push([varis, varisId, referansFiyat, jsonUrl, normalized.length, "OK"]);
+      debugRows.push([varis, varisId, referansFiyat, pageUrl, normalized.length, `OK | ${jsonUrl}`]);
 
       for (const item of normalized) {
         if (item.price !== referansFiyat) {
@@ -191,14 +186,14 @@ async function main() {
         }
       }
     } catch (err) {
-      debugRows.push([varis, varisId, referansFiyat, "", 0, String(err.message || err)]);
+      debugRows.push([varis, varisId, referansFiyat, `https://www.obilet.com/seferler/${NIGDE_ID}-${varisId}/${tarih}`, 0, String(err.message || err)]);
     }
   }
 
   await browser.close();
 
   if (resultRows.length === 0) {
-    resultRows.push(["Niğde", "-", tarih, "-", "-", "-", "-", "Farkli fiyat bulunamadi"]);
+    resultRows.push([NIGDE_NAME, "-", tarih, "-", "-", "-", "-", "Farkli fiyat bulunamadi"]);
   }
 
   await writeResults(sheets, resultRows);
