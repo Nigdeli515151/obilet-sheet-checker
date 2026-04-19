@@ -23,6 +23,12 @@ function getTomorrowDateTR() {
   return `${y}-${m}-${d}`;
 }
 
+function getNowTR() {
+  return new Date().toLocaleString("tr-TR", {
+    timeZone: "Europe/Istanbul"
+  });
+}
+
 function parseGoogleCredentials() {
   const raw = process.env.GOOGLE_CREDENTIALS_JSON;
   if (!raw) throw new Error("GOOGLE_CREDENTIALS_JSON eksik.");
@@ -138,10 +144,10 @@ async function waitForJourneyJson(page, originId, destinationId, dateStr) {
   };
 }
 
-async function fetchJourneysWithOnePage(page, destinationId, dateStr) {
-  const pageUrl = `https://www.obilet.com/seferler/${NIGDE_ID}-${destinationId}/${dateStr}`;
+async function fetchJourneysWithOnePage(page, originId, destinationId, dateStr) {
+  const pageUrl = `https://www.obilet.com/seferler/${originId}-${destinationId}/${dateStr}`;
 
-  const waitJsonPromise = waitForJourneyJson(page, NIGDE_ID, destinationId, dateStr);
+  const waitJsonPromise = waitForJourneyJson(page, originId, destinationId, dateStr);
 
   await page.goto(pageUrl, {
     waitUntil: "domcontentloaded",
@@ -169,7 +175,7 @@ async function fetchJourneysWithOnePage(page, destinationId, dateStr) {
         url: res.url,
         text
       };
-    }, { originId: NIGDE_ID, destinationId, dateStr });
+    }, { originId, destinationId, dateStr });
 
     if (!fallback.ok) {
       throw new Error(`JSON yakalanamadi. Fallback HTTP ${fallback.status}`);
@@ -189,13 +195,13 @@ async function fetchJourneysWithOnePage(page, destinationId, dateStr) {
   };
 }
 
-async function fetchJourneysWithRetry(page, destinationId, dateStr, logger) {
+async function fetchJourneysWithRetry(page, originId, destinationId, dateStr, logger) {
   let lastError = null;
 
   for (let attempt = 1; attempt <= RETRY_COUNT; attempt++) {
     try {
       logger(`deneme ${attempt} basladi`);
-      const data = await fetchJourneysWithOnePage(page, destinationId, dateStr);
+      const data = await fetchJourneysWithOnePage(page, originId, destinationId, dateStr);
       logger(`deneme ${attempt} basarili`);
       return data;
     } catch (err) {
@@ -208,12 +214,28 @@ async function fetchJourneysWithRetry(page, destinationId, dateStr, logger) {
   throw lastError || new Error("Bilinmeyen hata");
 }
 
+function sortResultRows(rows) {
+  rows.sort((a, b) => {
+    const firma = String(a[0]).localeCompare(String(b[0]), "tr");
+    if (firma !== 0) return firma;
+
+    const yon = String(a[1]).localeCompare(String(b[1]), "tr");
+    if (yon !== 0) return yon;
+
+    const guzergah = String(a[2]).localeCompare(String(b[2]), "tr");
+    if (guzergah !== 0) return guzergah;
+
+    return String(a[4]).localeCompare(String(b[4]));
+  });
+}
+
 async function main() {
   if (!SHEET_ID) throw new Error("SHEET_ID eksik.");
 
   const sheets = await getSheetsClient();
   const routes = await readRoutes(sheets);
   const tarih = getTomorrowDateTR();
+  const sonKontrol = getNowTR();
 
   const browser = await chromium.launch({ headless: true });
 
@@ -229,20 +251,53 @@ async function main() {
     pages.push(await createPage(context));
   }
 
-  const debugMap = new Map();
-  const resultRows = [];
+  const jobs = [];
+  let jobIndex = 0;
 
   for (const route of routes) {
-    debugMap.set(route.index, [
-      route.varis,
-      route.varisId,
-      route.referansFiyat,
-      "",
+    if (!route.varis || !route.varisId || !Number.isFinite(route.referansFiyat) || route.referansFiyat <= 0) {
+      continue;
+    }
+
+    jobs.push({
+      routeIndex: jobIndex++,
+      routeName: route.varis,
+      routeId: route.varisId,
+      referansFiyat: route.referansFiyat,
+      direction: "Gidis",
+      originId: NIGDE_ID,
+      originName: NIGDE_NAME,
+      destinationId: route.varisId,
+      destinationName: route.varis
+    });
+
+    jobs.push({
+      routeIndex: jobIndex++,
+      routeName: route.varis,
+      routeId: route.varisId,
+      referansFiyat: route.referansFiyat,
+      direction: "Donus",
+      originId: route.varisId,
+      originName: route.varis,
+      destinationId: NIGDE_ID,
+      destinationName: NIGDE_NAME
+    });
+  }
+
+  const debugMap = new Map();
+  for (let i = 0; i < jobs.length; i++) {
+    const j = jobs[i];
+    debugMap.set(i, [
+      j.routeName,
+      j.routeId,
+      j.referansFiyat,
+      `${j.direction} | ${j.originName} -> ${j.destinationName}`,
       0,
       "Sirada"
     ]);
   }
 
+  const resultRows = [];
   let writeChain = Promise.resolve();
 
   const syncSheets = async () => {
@@ -251,15 +306,15 @@ async function main() {
       .map(([, row]) => row);
 
     const debugValues = [
-      ["Varis", "VarisID", "ReferansFiyat", "SayfaURL", "SeferSayisi", "Durum"],
+      ["Varis", "VarisID", "ReferansFiyat", "YonGuzergah", "SeferSayisi", "Durum"],
       ...debugRows
     ];
 
     const resultValues = [
-      ["Kalkis", "Varis", "Tarih", "Saat", "Firma", "ObiletFiyati", "ReferansFiyat", "Fark", "Kaynak"],
+      ["Firma", "Yon", "Guzergah", "Tarih", "Saat", "Fiyat", "SonKontrol"],
       ...(resultRows.length
         ? resultRows
-        : [[NIGDE_NAME, "-", tarih, "-", "-", "-", "-", "-", "Farkli fiyat bulunamadi"]])
+        : [["-", "-", "-", tarih, "-", "-", sonKontrol]])
     ];
 
     await clearAndWriteRange(sheets, `${SHEET_DEBUG_NAME}!A:Z`, debugValues);
@@ -267,11 +322,9 @@ async function main() {
   };
 
   const queueSync = () => {
-    writeChain = writeChain
-      .then(() => syncSheets())
-      .catch((err) => {
-        console.error("Sheet sync hatasi:", err);
-      });
+    writeChain = writeChain.then(syncSheets).catch((err) => {
+      console.error("Sheet sync hatasi:", err);
+    });
     return writeChain;
   };
 
@@ -286,18 +339,29 @@ async function main() {
       const currentIndex = cursor;
       cursor += 1;
 
-      if (currentIndex >= routes.length) return;
+      if (currentIndex >= jobs.length) return;
 
-      const route = routes[currentIndex];
-      const { index, varis, varisId, referansFiyat } = route;
+      const job = jobs[currentIndex];
+      const {
+        routeName,
+        routeId,
+        referansFiyat,
+        direction,
+        originId,
+        originName,
+        destinationId,
+        destinationName
+      } = job;
 
-      const logPrefix = `[worker ${workerId + 1}] ${varis} (${varisId})`;
-      const setDebug = async (status, pageUrl = "", seferSayisi = 0) => {
-        debugMap.set(index, [
-          varis,
-          varisId,
+      const pageUrl = `https://www.obilet.com/seferler/${originId}-${destinationId}/${tarih}`;
+      const logPrefix = `[worker ${workerId + 1}] ${direction} ${originName} -> ${destinationName}`;
+
+      const setDebug = async (status, seferSayisi = 0) => {
+        debugMap.set(currentIndex, [
+          routeName,
+          routeId,
           referansFiyat,
-          pageUrl,
+          `${direction} | ${originName} -> ${destinationName}`,
           seferSayisi,
           status
         ]);
@@ -305,45 +369,39 @@ async function main() {
         await queueSync();
       };
 
-      if (!varis || !varisId || !Number.isFinite(referansFiyat) || referansFiyat <= 0) {
-        await setDebug("Eksik veri", "", 0);
-        continue;
-      }
-
       try {
-        await setDebug("Basladi", "", 0);
+        await setDebug("Basladi", 0);
 
         const logger = (msg) => console.log(`${logPrefix} -> ${msg}`);
-        const { pageUrl, jsonUrl, journeys } = await fetchJourneysWithRetry(page, varisId, tarih, logger);
-        const normalized = normalizeJourneys(journeys);
+        const { jsonUrl, journeys } = await fetchJourneysWithRetry(
+          page,
+          originId,
+          destinationId,
+          tarih,
+          logger
+        );
 
-        await setDebug(`OK | ${jsonUrl}`, pageUrl, normalized.length);
+        const normalized = normalizeJourneys(journeys);
+        await setDebug(`OK | ${jsonUrl}`, normalized.length);
 
         for (const item of normalized) {
-          if (item.price !== referansFiyat) {
+          if (item.price < referansFiyat) {
             resultRows.push([
-              NIGDE_NAME,
-              varis,
+              item.company,
+              direction,
+              `${originName} -> ${destinationName}`,
               tarih,
               item.hour,
-              item.company,
               item.price,
-              referansFiyat,
-              item.price - referansFiyat,
-              jsonUrl
+              sonKontrol
             ]);
           }
         }
 
-        resultRows.sort((a, b) => {
-          const city = String(a[1]).localeCompare(String(b[1]), "tr");
-          if (city !== 0) return city;
-          return String(a[3]).localeCompare(String(b[3]));
-        });
-
+        sortResultRows(resultRows);
         await queueSync();
       } catch (err) {
-        await setDebug(`Hata | ${String(err.message || err)}`, `https://www.obilet.com/seferler/${NIGDE_ID}-${varisId}/${tarih}`, 0);
+        await setDebug(`Hata | ${String(err.message || err)}`, 0);
       }
 
       await page.waitForTimeout(500);
