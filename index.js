@@ -12,21 +12,22 @@ const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 const NIGDE_ID = 398;
 const NIGDE_NAME = "Niğde";
 
-const CONCURRENCY = 2;
+const CONCURRENCY = 3;
 const RESPONSE_TIMEOUT_MS = 15000;
 const PAGE_TIMEOUT_MS = 45000;
 const RETRY_COUNT = 2;
 const SYNC_EVERY_N_UPDATES = 4;
 
-const MIN_DELAY_MS = 20000;
-const MAX_DELAY_MS = 40000;
+const MIN_DELAY_MS = 12000;
+const MAX_DELAY_MS = 22000;
 
-const WORKER_START_STAGGER_MS = 30000;
-const CONTEXT_ROTATE_EVERY_JOBS = 2;
+const WORKER_START_STAGGER_MS = 15000;
+const CONTEXT_ROTATE_EVERY_JOBS = 3;
 
 const USER_AGENTS = [
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-  "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+  "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 ];
 
 function getTomorrowDateTR() {
@@ -655,7 +656,7 @@ async function main() {
     await randomSleep(workerState.page);
   }
 
-  async function runPass(passJobs, passNo) {
+  async function runPass(passJobs) {
     let cursor = 0;
 
     async function worker(workerId) {
@@ -683,7 +684,7 @@ async function main() {
 
   await queueSync(true);
 
-  await runPass(jobs, 1);
+  await runPass(jobs);
 
   if (failedForSecondPass.length > 0) {
     const secondPassJobs = shuffleArray(failedForSecondPass);
@@ -693,7 +694,7 @@ async function main() {
       await workerStates[i].page.waitForTimeout(randInt(7000, 12000));
     }
 
-    await runPass(secondPassJobs, 2);
+    await runPass(secondPassJobs);
   }
 
   await queueSync(true);
