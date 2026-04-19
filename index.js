@@ -13,6 +13,7 @@ const CONCURRENCY = 4;
 const RESPONSE_TIMEOUT_MS = 15000;
 const PAGE_TIMEOUT_MS = 45000;
 const RETRY_COUNT = 2;
+const SYNC_EVERY_N_UPDATES = 5;
 
 function getTomorrowDateTR() {
   const now = new Date();
@@ -299,6 +300,7 @@ async function main() {
 
   const resultRows = [];
   let writeChain = Promise.resolve();
+  let pendingSyncCounter = 0;
 
   const syncSheets = async () => {
     const debugRows = Array.from(debugMap.entries())
@@ -321,14 +323,23 @@ async function main() {
     await clearAndWriteRange(sheets, `${SHEET_OUTPUT_NAME}!A:Z`, resultValues);
   };
 
-  const queueSync = () => {
+  const queueSync = (force = false) => {
+    pendingSyncCounter += 1;
+
+    if (!force && pendingSyncCounter < SYNC_EVERY_N_UPDATES) {
+      return writeChain;
+    }
+
+    pendingSyncCounter = 0;
+
     writeChain = writeChain.then(syncSheets).catch((err) => {
       console.error("Sheet sync hatasi:", err);
     });
+
     return writeChain;
   };
 
-  await queueSync();
+  await queueSync(true);
 
   let cursor = 0;
 
@@ -353,7 +364,6 @@ async function main() {
         destinationName
       } = job;
 
-      const pageUrl = `https://www.obilet.com/seferler/${originId}-${destinationId}/${tarih}`;
       const logPrefix = `[worker ${workerId + 1}] ${direction} ${originName} -> ${destinationName}`;
 
       const setDebug = async (status, seferSayisi = 0) => {
@@ -366,7 +376,7 @@ async function main() {
           status
         ]);
         console.log(`${logPrefix} -> ${status}`);
-        await queueSync();
+        await queueSync(false);
       };
 
       try {
@@ -399,7 +409,7 @@ async function main() {
         }
 
         sortResultRows(resultRows);
-        await queueSync();
+        await queueSync(false);
       } catch (err) {
         await setDebug(`Hata | ${String(err.message || err)}`, 0);
       }
@@ -412,6 +422,7 @@ async function main() {
     Array.from({ length: CONCURRENCY }, (_, i) => worker(i))
   );
 
+  await queueSync(true);
   await writeChain;
 
   for (const page of pages) await page.close();
