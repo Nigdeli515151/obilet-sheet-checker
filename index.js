@@ -6,6 +6,9 @@ const SHEET_INPUT_NAME = "Guzergahlar";
 const SHEET_OUTPUT_NAME = "Farkli_Fiyatlar";
 const SHEET_DEBUG_NAME = "Debug";
 
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
+
 const NIGDE_ID = 398;
 const NIGDE_NAME = "Niğde";
 
@@ -402,6 +405,99 @@ function buildJobs(routes) {
   return shuffleArray(jobs);
 }
 
+function groupRowsByCompany(rows) {
+  const map = new Map();
+
+  for (const row of rows) {
+    const [firma, yon, guzergah, tarih, saat, fiyat] = row;
+
+    if (!map.has(firma)) {
+      map.set(firma, []);
+    }
+
+    map.get(firma).push({
+      yon,
+      guzergah,
+      tarih,
+      saat,
+      fiyat
+    });
+  }
+
+  for (const [, items] of map) {
+    items.sort((a, b) => {
+      const routeCmp = String(a.guzergah).localeCompare(String(b.guzergah), "tr");
+      if (routeCmp !== 0) return routeCmp;
+      return String(a.saat).localeCompare(String(b.saat));
+    });
+  }
+
+  return map;
+}
+
+function buildTelegramMessages(resultRows, sonKontrol) {
+  if (!resultRows.length) {
+    return [`Kontrol bitti.\nUygun fiyat bulunamadi.\nSon kontrol: ${sonKontrol}`];
+  }
+
+  const grouped = groupRowsByCompany(resultRows);
+  const messages = [];
+
+  let current = `Kontrol bitti.\nSon kontrol: ${sonKontrol}\n`;
+
+  for (const [firma, items] of grouped.entries()) {
+    let section = `\n${firma}\n`;
+
+    for (const item of items) {
+      section += `- ${item.yon} | ${item.guzergah} | ${item.saat} | ${item.fiyat} TL\n`;
+    }
+
+    if ((current + section).length > 3500) {
+      messages.push(current.trim());
+      current = section;
+    } else {
+      current += section;
+    }
+  }
+
+  if (current.trim()) {
+    messages.push(current.trim());
+  }
+
+  return messages;
+}
+
+async function sendTelegramMessage(text) {
+  if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
+    console.log("Telegram bilgileri eksik, mesaj gonderilmedi.");
+    return;
+  }
+
+  const res = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      chat_id: TELEGRAM_CHAT_ID,
+      text
+    })
+  });
+
+  if (!res.ok) {
+    const txt = await res.text();
+    throw new Error(`Telegram gonderim hatasi: ${res.status} ${txt}`);
+  }
+}
+
+async function sendTelegramResultList(resultRows, sonKontrol) {
+  const messages = buildTelegramMessages(resultRows, sonKontrol);
+
+  for (const msg of messages) {
+    await sendTelegramMessage(msg);
+  }
+}
+
 async function main() {
   if (!SHEET_ID) throw new Error("SHEET_ID eksik.");
 
@@ -609,6 +705,8 @@ async function main() {
   }
 
   await browser.close();
+
+  await sendTelegramResultList(resultRows, sonKontrol);
 
   console.log("Tamamlandi.");
 }
