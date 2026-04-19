@@ -9,17 +9,22 @@ const SHEET_DEBUG_NAME = "Debug";
 const NIGDE_ID = 398;
 const NIGDE_NAME = "Niğde";
 
-const CONCURRENCY = 3;
+const CONCURRENCY = 2;
 const RESPONSE_TIMEOUT_MS = 15000;
 const PAGE_TIMEOUT_MS = 45000;
 const RETRY_COUNT = 2;
 const SYNC_EVERY_N_UPDATES = 4;
 
-const MIN_DELAY_MS = 15000;
-const MAX_DELAY_MS = 23000;
+const MIN_DELAY_MS = 20000;
+const MAX_DELAY_MS = 40000;
 
-const CONTEXT_ROTATE_EVERY_JOBS = 3;
-const FAILED_SECOND_PASS = true;
+const WORKER_START_STAGGER_MS = 30000;
+const CONTEXT_ROTATE_EVERY_JOBS = 2;
+
+const USER_AGENTS = [
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
+];
 
 function getTomorrowDateTR() {
   const now = new Date();
@@ -38,6 +43,15 @@ function getNowTR() {
 
 function randInt(min, max) {
   return Math.floor(Math.random() * (max - min + 1)) + min;
+}
+
+function shuffleArray(arr) {
+  const copy = [...arr];
+  for (let i = copy.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [copy[i], copy[j]] = [copy[j], copy[i]];
+  }
+  return copy;
 }
 
 async function randomSleep(page, minMs = MIN_DELAY_MS, maxMs = MAX_DELAY_MS) {
@@ -127,10 +141,10 @@ async function clearAndWriteRange(sheets, range, values) {
   });
 }
 
-async function createContextAndPage(browser) {
+async function createContextAndPage(browser, workerId) {
   const context = await browser.newContext({
     locale: "tr-TR",
-    userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    userAgent: USER_AGENTS[workerId % USER_AGENTS.length]
   });
 
   const page = await context.newPage();
@@ -148,7 +162,7 @@ async function createContextAndPage(browser) {
   return { context, page };
 }
 
-async function rotateWorkerResources(browser, workerState) {
+async function rotateWorkerResources(browser, workerState, workerId) {
   if (workerState.page) {
     try { await workerState.page.close(); } catch {}
   }
@@ -156,7 +170,7 @@ async function rotateWorkerResources(browser, workerState) {
     try { await workerState.context.close(); } catch {}
   }
 
-  const fresh = await createContextAndPage(browser);
+  const fresh = await createContextAndPage(browser, workerId);
   workerState.context = fresh.context;
   workerState.page = fresh.page;
   workerState.jobsSinceRotate = 0;
@@ -313,7 +327,7 @@ async function fetchJourneysWithRetry(page, context, originId, destinationId, da
     } catch (err) {
       lastError = err;
       logger(`deneme ${attempt} hata: ${String(err.message || err)}`);
-      await page.waitForTimeout(randInt(4000, 7000));
+      await page.waitForTimeout(randInt(5000, 9000));
     }
   }
 
@@ -337,6 +351,8 @@ function sortResultRows(rows) {
 
 function isRetryableError(message) {
   const s = String(message || "").toLowerCase();
+  if (s.includes("404") || s.includes("bulunamadi")) return false;
+
   return (
     s.includes("403") ||
     s.includes("engellendi") ||
@@ -347,26 +363,7 @@ function isRetryableError(message) {
   );
 }
 
-async function main() {
-  if (!SHEET_ID) throw new Error("SHEET_ID eksik.");
-
-  const sheets = await getSheetsClient();
-  const routes = await readRoutes(sheets);
-  const tarih = getTomorrowDateTR();
-  const sonKontrol = getNowTR();
-
-  const browser = await chromium.launch({ headless: true });
-
-  const workerStates = [];
-  for (let i = 0; i < CONCURRENCY; i++) {
-    workerStates.push({
-      context: null,
-      page: null,
-      jobsSinceRotate: 0
-    });
-    await rotateWorkerResources(browser, workerStates[i]);
-  }
-
+function buildJobs(routes) {
   const jobs = [];
   let jobIndex = 0;
 
@@ -402,10 +399,34 @@ async function main() {
     });
   }
 
+  return shuffleArray(jobs);
+}
+
+async function main() {
+  if (!SHEET_ID) throw new Error("SHEET_ID eksik.");
+
+  const sheets = await getSheetsClient();
+  const routes = await readRoutes(sheets);
+  const tarih = getTomorrowDateTR();
+  const sonKontrol = getNowTR();
+
+  const browser = await chromium.launch({ headless: true });
+
+  const workerStates = [];
+  for (let i = 0; i < CONCURRENCY; i++) {
+    workerStates.push({
+      context: null,
+      page: null,
+      jobsSinceRotate: 0
+    });
+    await rotateWorkerResources(browser, workerStates[i], i);
+  }
+
+  const jobs = buildJobs(routes);
+
   const debugMap = new Map();
-  for (let i = 0; i < jobs.length; i++) {
-    const j = jobs[i];
-    debugMap.set(i, [
+  for (const j of jobs) {
+    debugMap.set(j.queueIndex, [
       j.routeName,
       j.routeId,
       j.referansFiyat,
@@ -458,8 +479,9 @@ async function main() {
     return writeChain;
   };
 
-  async function runJob(workerId, workerState, job, jobDebugIndex) {
+  async function runJob(workerId, workerState, job) {
     const {
+      queueIndex,
       routeName,
       routeId,
       referansFiyat,
@@ -474,7 +496,7 @@ async function main() {
     const logPrefix = `[worker ${workerId + 1}] tur ${pass} ${direction} ${originName} -> ${destinationName}`;
 
     const setDebug = async (status, seferSayisi = 0) => {
-      debugMap.set(jobDebugIndex, [
+      debugMap.set(queueIndex, [
         routeName,
         routeId,
         referansFiyat,
@@ -488,8 +510,8 @@ async function main() {
 
     if (workerState.jobsSinceRotate >= CONTEXT_ROTATE_EVERY_JOBS) {
       await setDebug("Context yenileniyor", 0);
-      await rotateWorkerResources(browser, workerState);
-      await randomSleep(workerState.page, 3000, 6000);
+      await rotateWorkerResources(browser, workerState, workerId);
+      await workerState.page.waitForTimeout(randInt(5000, 9000));
     }
 
     try {
@@ -528,7 +550,7 @@ async function main() {
       const message = String(err.message || err);
       await setDebug(`Hata | ${message}`, 0);
 
-      if (pass === 1 && FAILED_SECOND_PASS && isRetryableError(message)) {
+      if (pass === 1 && isRetryableError(message)) {
         failedForSecondPass.push({ ...job, pass: 2 });
       }
     }
@@ -543,6 +565,10 @@ async function main() {
     async function worker(workerId) {
       const workerState = workerStates[workerId];
 
+      if (workerId > 0) {
+        await workerState.page.waitForTimeout(WORKER_START_STAGGER_MS * workerId);
+      }
+
       while (true) {
         const currentIndex = cursor;
         cursor += 1;
@@ -550,13 +576,7 @@ async function main() {
         if (currentIndex >= passJobs.length) return;
 
         const job = passJobs[currentIndex];
-
-        let debugIndex = job.queueIndex;
-        if (passNo === 2) {
-          debugIndex = job.queueIndex;
-        }
-
-        await runJob(workerId, workerState, job, debugIndex);
+        await runJob(workerId, workerState, job);
       }
     }
 
@@ -569,13 +589,15 @@ async function main() {
 
   await runPass(jobs, 1);
 
-  if (FAILED_SECOND_PASS && failedForSecondPass.length > 0) {
-    for (const workerState of workerStates) {
-      await rotateWorkerResources(browser, workerState);
-      await randomSleep(workerState.page, 6000, 9000);
+  if (failedForSecondPass.length > 0) {
+    const secondPassJobs = shuffleArray(failedForSecondPass);
+
+    for (let i = 0; i < workerStates.length; i++) {
+      await rotateWorkerResources(browser, workerStates[i], i);
+      await workerStates[i].page.waitForTimeout(randInt(7000, 12000));
     }
 
-    await runPass(failedForSecondPass, 2);
+    await runPass(secondPassJobs, 2);
   }
 
   await queueSync(true);
