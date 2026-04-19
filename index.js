@@ -81,18 +81,28 @@ async function getSheetsClient() {
 async function readRoutes(sheets) {
   const res = await sheets.spreadsheets.values.get({
     spreadsheetId: SHEET_ID,
-    range: `${SHEET_INPUT_NAME}!A:C`
+    range: `${SHEET_INPUT_NAME}!A:D`
   });
 
   const rows = res.data.values || [];
   if (rows.length <= 1) return [];
 
-  return rows.slice(1).map((row, index) => ({
-    index,
-    varis: String(row[0] || "").trim(),
-    varisId: String(row[1] || "").trim(),
-    referansFiyat: Number(row[2] || 0)
-  }));
+  return rows.slice(1).map((row, index) => {
+    const aktifRaw = String(row[3] || "").trim().toLowerCase();
+
+    return {
+      index,
+      varis: String(row[0] || "").trim(),
+      varisId: String(row[1] || "").trim(),
+      referansFiyat: Number(row[2] || 0),
+      aktif:
+        aktifRaw === "true" ||
+        aktifRaw === "evet" ||
+        aktifRaw === "1" ||
+        aktifRaw === "x" ||
+        aktifRaw === "aktif"
+    };
+  });
 }
 
 function formatHour(value) {
@@ -372,6 +382,10 @@ function buildJobs(routes) {
   let jobIndex = 0;
 
   for (const route of routes) {
+    if (!route.aktif) {
+      continue;
+    }
+
     if (!route.varis || !route.varisId || !Number.isFinite(route.referansFiyat) || route.referansFiyat <= 0) {
       continue;
     }
