@@ -9,11 +9,17 @@ const SHEET_DEBUG_NAME = "Debug";
 const NIGDE_ID = 398;
 const NIGDE_NAME = "Niğde";
 
-const CONCURRENCY = 4;
+const CONCURRENCY = 3;
 const RESPONSE_TIMEOUT_MS = 15000;
 const PAGE_TIMEOUT_MS = 45000;
 const RETRY_COUNT = 2;
-const SYNC_EVERY_N_UPDATES = 5;
+const SYNC_EVERY_N_UPDATES = 4;
+
+const MIN_DELAY_MS = 15000;
+const MAX_DELAY_MS = 23000;
+
+const CONTEXT_ROTATE_EVERY_JOBS = 3;
+const FAILED_SECOND_PASS = true;
 
 function getTomorrowDateTR() {
   const now = new Date();
@@ -28,6 +34,15 @@ function getNowTR() {
   return new Date().toLocaleString("tr-TR", {
     timeZone: "Europe/Istanbul"
   });
+}
+
+function randInt(min, max) {
+  return Math.floor(Math.random() * (max - min + 1)) + min;
+}
+
+async function randomSleep(page, minMs = MIN_DELAY_MS, maxMs = MAX_DELAY_MS) {
+  const waitMs = randInt(minMs, maxMs);
+  await page.waitForTimeout(waitMs);
 }
 
 function parseGoogleCredentials() {
@@ -112,7 +127,12 @@ async function clearAndWriteRange(sheets, range, values) {
   });
 }
 
-async function createPage(context) {
+async function createContextAndPage(browser) {
+  const context = await browser.newContext({
+    locale: "tr-TR",
+    userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+  });
+
   const page = await context.newPage();
   page.setDefaultTimeout(PAGE_TIMEOUT_MS);
 
@@ -125,7 +145,21 @@ async function createPage(context) {
     await route.continue();
   });
 
-  return page;
+  return { context, page };
+}
+
+async function rotateWorkerResources(browser, workerState) {
+  if (workerState.page) {
+    try { await workerState.page.close(); } catch {}
+  }
+  if (workerState.context) {
+    try { await workerState.context.close(); } catch {}
+  }
+
+  const fresh = await createContextAndPage(browser);
+  workerState.context = fresh.context;
+  workerState.page = fresh.page;
+  workerState.jobsSinceRotate = 0;
 }
 
 async function waitForJourneyJson(page, originId, destinationId, dateStr, timeoutMs) {
@@ -185,21 +219,21 @@ async function fetchJourneysRobust(page, context, originId, destinationId, dateS
       journeys: result.journeys,
       statusText: "OK"
     };
-  } catch (err1) {
-    logger("ilk response bekleme basarisiz, sayfada ekstra bekleniyor");
+  } catch {
+    logger("ilk response bekleme basarisiz, ekstra bekleme");
   }
 
-  await page.waitForTimeout(5000);
+  await page.waitForTimeout(6000);
 
   try {
-    const lateResult = await waitForJourneyJson(page, originId, destinationId, dateStr, 7000);
+    const lateResult = await waitForJourneyJson(page, originId, destinationId, dateStr, 8000);
     return {
       pageUrl,
       jsonUrl: lateResult.url,
       journeys: lateResult.journeys,
       statusText: "Gec geldi ama alindi"
     };
-  } catch (err2) {
+  } catch {
     logger("gec response da gelmedi, sayfa ici fetch deneniyor");
   }
 
@@ -217,7 +251,9 @@ async function fetchJourneysRobust(page, context, originId, destinationId, dateS
 
   logger(`sayfa ici fetch basarisiz: HTTP ${fallback.status}, yeni sekme deneniyor`);
 
-  const retryPage = await createPage(context);
+  const retryPage = await context.newPage();
+  retryPage.setDefaultTimeout(PAGE_TIMEOUT_MS);
+
   try {
     const retryWaitPromise = waitForJourneyJson(retryPage, originId, destinationId, dateStr, RESPONSE_TIMEOUT_MS);
     await retryPage.goto(pageUrl, {
@@ -233,11 +269,11 @@ async function fetchJourneysRobust(page, context, originId, destinationId, dateS
         journeys: retryResult.journeys,
         statusText: "Yeniden denemede alindi"
       };
-    } catch (err3) {
-      logger("yeni sekmede de response bekleme basarisiz, sayfa ici fetch tekrar deneniyor");
+    } catch {
+      logger("yeni sekmede response bekleme basarisiz, fetch tekrar deneniyor");
     }
 
-    await retryPage.waitForTimeout(4000);
+    await retryPage.waitForTimeout(5000);
 
     const retryFallback = await pageFetchJson(retryPage, originId, destinationId, dateStr);
 
@@ -261,7 +297,7 @@ async function fetchJourneysRobust(page, context, originId, destinationId, dateS
 
     throw new Error(`JSON alinamadi | HTTP ${retryFallback.status}`);
   } finally {
-    await retryPage.close();
+    try { await retryPage.close(); } catch {}
   }
 }
 
@@ -277,7 +313,7 @@ async function fetchJourneysWithRetry(page, context, originId, destinationId, da
     } catch (err) {
       lastError = err;
       logger(`deneme ${attempt} hata: ${String(err.message || err)}`);
-      await page.waitForTimeout(1500 * attempt);
+      await page.waitForTimeout(randInt(4000, 7000));
     }
   }
 
@@ -299,6 +335,18 @@ function sortResultRows(rows) {
   });
 }
 
+function isRetryableError(message) {
+  const s = String(message || "").toLowerCase();
+  return (
+    s.includes("403") ||
+    s.includes("engellendi") ||
+    s.includes("zaman") ||
+    s.includes("timeout") ||
+    s.includes("json alinamadi") ||
+    s.includes("response")
+  );
+}
+
 async function main() {
   if (!SHEET_ID) throw new Error("SHEET_ID eksik.");
 
@@ -309,16 +357,14 @@ async function main() {
 
   const browser = await chromium.launch({ headless: true });
 
-  const contexts = [];
-  const pages = [];
-
+  const workerStates = [];
   for (let i = 0; i < CONCURRENCY; i++) {
-    const context = await browser.newContext({
-      locale: "tr-TR",
-      userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    workerStates.push({
+      context: null,
+      page: null,
+      jobsSinceRotate: 0
     });
-    contexts.push(context);
-    pages.push(await createPage(context));
+    await rotateWorkerResources(browser, workerStates[i]);
   }
 
   const jobs = [];
@@ -330,7 +376,7 @@ async function main() {
     }
 
     jobs.push({
-      routeIndex: jobIndex++,
+      queueIndex: jobIndex++,
       routeName: route.varis,
       routeId: route.varisId,
       referansFiyat: route.referansFiyat,
@@ -338,11 +384,12 @@ async function main() {
       originId: NIGDE_ID,
       originName: NIGDE_NAME,
       destinationId: route.varisId,
-      destinationName: route.varis
+      destinationName: route.varis,
+      pass: 1
     });
 
     jobs.push({
-      routeIndex: jobIndex++,
+      queueIndex: jobIndex++,
       routeName: route.varis,
       routeId: route.varisId,
       referansFiyat: route.referansFiyat,
@@ -350,7 +397,8 @@ async function main() {
       originId: route.varisId,
       originName: route.varis,
       destinationId: NIGDE_ID,
-      destinationName: NIGDE_NAME
+      destinationName: NIGDE_NAME,
+      pass: 1
     });
   }
 
@@ -363,11 +411,13 @@ async function main() {
       j.referansFiyat,
       `${j.direction} | ${j.originName} -> ${j.destinationName}`,
       0,
-      "Sirada"
+      "Sirada | Tur 1"
     ]);
   }
 
   const resultRows = [];
+  const failedForSecondPass = [];
+
   let writeChain = Promise.resolve();
   let pendingSyncCounter = 0;
 
@@ -408,96 +458,134 @@ async function main() {
     return writeChain;
   };
 
-  await queueSync(true);
+  async function runJob(workerId, workerState, job, jobDebugIndex) {
+    const {
+      routeName,
+      routeId,
+      referansFiyat,
+      direction,
+      originId,
+      originName,
+      destinationId,
+      destinationName,
+      pass
+    } = job;
 
-  let cursor = 0;
+    const logPrefix = `[worker ${workerId + 1}] tur ${pass} ${direction} ${originName} -> ${destinationName}`;
 
-  async function worker(workerId) {
-    const page = pages[workerId];
-    const context = contexts[workerId];
-
-    while (true) {
-      const currentIndex = cursor;
-      cursor += 1;
-
-      if (currentIndex >= jobs.length) return;
-
-      const job = jobs[currentIndex];
-      const {
+    const setDebug = async (status, seferSayisi = 0) => {
+      debugMap.set(jobDebugIndex, [
         routeName,
         routeId,
         referansFiyat,
-        direction,
+        `${direction} | ${originName} -> ${destinationName}`,
+        seferSayisi,
+        `${status} | Tur ${pass}`
+      ]);
+      console.log(`${logPrefix} -> ${status}`);
+      await queueSync(false);
+    };
+
+    if (workerState.jobsSinceRotate >= CONTEXT_ROTATE_EVERY_JOBS) {
+      await setDebug("Context yenileniyor", 0);
+      await rotateWorkerResources(browser, workerState);
+      await randomSleep(workerState.page, 3000, 6000);
+    }
+
+    try {
+      await setDebug("Basladi", 0);
+
+      const logger = (msg) => console.log(`${logPrefix} -> ${msg}`);
+      const { jsonUrl, journeys, statusText } = await fetchJourneysWithRetry(
+        workerState.page,
+        workerState.context,
         originId,
-        originName,
         destinationId,
-        destinationName
-      } = job;
+        tarih,
+        logger
+      );
 
-      const logPrefix = `[worker ${workerId + 1}] ${direction} ${originName} -> ${destinationName}`;
+      const normalized = normalizeJourneys(journeys);
+      await setDebug(`${statusText} | ${jsonUrl}`, normalized.length);
 
-      const setDebug = async (status, seferSayisi = 0) => {
-        debugMap.set(currentIndex, [
-          routeName,
-          routeId,
-          referansFiyat,
-          `${direction} | ${originName} -> ${destinationName}`,
-          seferSayisi,
-          status
-        ]);
-        console.log(`${logPrefix} -> ${status}`);
-        await queueSync(false);
-      };
-
-      try {
-        await setDebug("Basladi", 0);
-
-        const logger = (msg) => console.log(`${logPrefix} -> ${msg}`);
-        const { jsonUrl, journeys, statusText } = await fetchJourneysWithRetry(
-          page,
-          context,
-          originId,
-          destinationId,
-          tarih,
-          logger
-        );
-
-        const normalized = normalizeJourneys(journeys);
-        await setDebug(`${statusText} | ${jsonUrl}`, normalized.length);
-
-        for (const item of normalized) {
-          if (item.price < referansFiyat) {
-            resultRows.push([
-              item.company,
-              direction,
-              `${originName} -> ${destinationName}`,
-              tarih,
-              item.hour,
-              item.price,
-              sonKontrol
-            ]);
-          }
+      for (const item of normalized) {
+        if (item.price < referansFiyat) {
+          resultRows.push([
+            item.company,
+            direction,
+            `${originName} -> ${destinationName}`,
+            tarih,
+            item.hour,
+            item.price,
+            sonKontrol
+          ]);
         }
-
-        sortResultRows(resultRows);
-        await queueSync(false);
-      } catch (err) {
-        await setDebug(`Hata | ${String(err.message || err)}`, 0);
       }
 
-      await page.waitForTimeout(700);
+      sortResultRows(resultRows);
+      await queueSync(false);
+    } catch (err) {
+      const message = String(err.message || err);
+      await setDebug(`Hata | ${message}`, 0);
+
+      if (pass === 1 && FAILED_SECOND_PASS && isRetryableError(message)) {
+        failedForSecondPass.push({ ...job, pass: 2 });
+      }
     }
+
+    workerState.jobsSinceRotate += 1;
+    await randomSleep(workerState.page);
   }
 
-  await Promise.all(
-    Array.from({ length: CONCURRENCY }, (_, i) => worker(i))
-  );
+  async function runPass(passJobs, passNo) {
+    let cursor = 0;
+
+    async function worker(workerId) {
+      const workerState = workerStates[workerId];
+
+      while (true) {
+        const currentIndex = cursor;
+        cursor += 1;
+
+        if (currentIndex >= passJobs.length) return;
+
+        const job = passJobs[currentIndex];
+
+        let debugIndex = job.queueIndex;
+        if (passNo === 2) {
+          debugIndex = job.queueIndex;
+        }
+
+        await runJob(workerId, workerState, job, debugIndex);
+      }
+    }
+
+    await Promise.all(
+      Array.from({ length: CONCURRENCY }, (_, i) => worker(i))
+    );
+  }
+
+  await queueSync(true);
+
+  await runPass(jobs, 1);
+
+  if (FAILED_SECOND_PASS && failedForSecondPass.length > 0) {
+    for (const workerState of workerStates) {
+      await rotateWorkerResources(browser, workerState);
+      await randomSleep(workerState.page, 6000, 9000);
+    }
+
+    await runPass(failedForSecondPass, 2);
+  }
 
   await queueSync(true);
   await writeChain;
 
-  for (const page of pages) await page.close();
-  for (const context of contexts) await context.close();
+  for (const workerState of workerStates) {
+    try { await workerState.page.close(); } catch {}
+    try { await workerState.context.close(); } catch {}
+  }
+
   await browser.close();
 
   console.log("Tamamlandi.");
