@@ -399,18 +399,7 @@ function sortResultRows(rows) {
 }
 
 function isRetryableError(message) {
-  const s = String(message || "").toLowerCase();
-
-  return (
-    s.includes("403") ||
-    s.includes("404") ||
-    s.includes("engellendi") ||
-    s.includes("bulunamadi") ||
-    s.includes("zaman") ||
-    s.includes("timeout") ||
-    s.includes("json alinamadi") ||
-    s.includes("response")
-  );
+  return true;
 }
 
 function buildJobs(routes) {
