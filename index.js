@@ -8,6 +8,7 @@ const SHEET_DEBUG_NAME = "Debug";
 
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
+const TARGET_DATE = process.env.TARGET_DATE;
 
 const NIGDE_ID = 398;
 const NIGDE_NAME = "Niğde";
@@ -42,6 +43,35 @@ function getTomorrowDateTR() {
   const d = String(trNow.getDate()).padStart(2, "0");
 
   return `${y}-${m}-${d}`;
+}
+
+function isValidDateString(value) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(value || ""))) {
+    return false;
+  }
+
+  const d = new Date(`${value}T00:00:00`);
+  if (Number.isNaN(d.getTime())) {
+    return false;
+  }
+
+  const [y, m, day] = String(value).split("-").map(Number);
+
+  return (
+    d.getFullYear() === y &&
+    d.getMonth() + 1 === m &&
+    d.getDate() === day
+  );
+}
+
+function resolveTargetDateTR() {
+  const manual = String(TARGET_DATE || "").trim();
+
+  if (manual && isValidDateString(manual)) {
+    return manual;
+  }
+
+  return getTomorrowDateTR();
 }
 
 function getNowTR() {
@@ -370,11 +400,12 @@ function sortResultRows(rows) {
 
 function isRetryableError(message) {
   const s = String(message || "").toLowerCase();
-  if (s.includes("404") || s.includes("bulunamadi")) return false;
 
   return (
     s.includes("403") ||
+    s.includes("404") ||
     s.includes("engellendi") ||
+    s.includes("bulunamadi") ||
     s.includes("zaman") ||
     s.includes("timeout") ||
     s.includes("json alinamadi") ||
@@ -455,15 +486,52 @@ function groupRowsByCompany(rows) {
   return map;
 }
 
-function buildTelegramMessages(resultRows, sonKontrol) {
+function splitLongTelegramText(text, maxLen = 3500) {
+  if (text.length <= maxLen) {
+    return [text];
+  }
+
+  const lines = text.split("\n");
+  const out = [];
+  let current = "";
+
+  for (const line of lines) {
+    const candidate = current ? `${current}\n${line}` : line;
+
+    if (candidate.length > maxLen) {
+      if (current) {
+        out.push(current);
+        current = line;
+      } else {
+        // tek satır çok uzunsa sert böl
+        let start = 0;
+        while (start < line.length) {
+          out.push(line.slice(start, start + maxLen));
+          start += maxLen;
+        }
+        current = "";
+      }
+    } else {
+      current = candidate;
+    }
+  }
+
+  if (current) {
+    out.push(current);
+  }
+
+  return out;
+}
+
+function buildTelegramMessages(resultRows, sonKontrol, tarih) {
   if (!resultRows.length) {
-    return [`Kontrol bitti.\nUygun fiyat bulunamadi.\nSon kontrol: ${sonKontrol}`];
+    return [`Kontrol bitti.\nTarih: ${tarih}\nUygun fiyat bulunamadi.\nSon kontrol: ${sonKontrol}`];
   }
 
   const grouped = groupRowsByCompany(resultRows);
   const messages = [];
 
-  let current = `Kontrol bitti.\nSon kontrol: ${sonKontrol}\n`;
+  let current = `Kontrol bitti.\nTarih: ${tarih}\nSon kontrol: ${sonKontrol}\n`;
 
   for (const [firma, items] of grouped.entries()) {
     let section = `\n${firma}\n`;
@@ -472,8 +540,8 @@ function buildTelegramMessages(resultRows, sonKontrol) {
       section += `- ${item.yon} | ${item.guzergah} | ${item.saat} | ${item.fiyat} TL\n`;
     }
 
-    if ((current + section).length > 3500) {
-      messages.push(current.trim());
+    if ((current + section).length > 3200) {
+      messages.push(...splitLongTelegramText(current.trim(), 3500));
       current = section;
     } else {
       current += section;
@@ -481,7 +549,7 @@ function buildTelegramMessages(resultRows, sonKontrol) {
   }
 
   if (current.trim()) {
-    messages.push(current.trim());
+    messages.push(...splitLongTelegramText(current.trim(), 3500));
   }
 
   return messages;
@@ -510,8 +578,8 @@ async function sendTelegramMessage(text) {
   }
 }
 
-async function sendTelegramResultList(resultRows, sonKontrol) {
-  const messages = buildTelegramMessages(resultRows, sonKontrol);
+async function sendTelegramResultList(resultRows, sonKontrol, tarih) {
+  const messages = buildTelegramMessages(resultRows, sonKontrol, tarih);
 
   for (const msg of messages) {
     await sendTelegramMessage(msg);
@@ -523,7 +591,7 @@ async function main() {
 
   const sheets = await getSheetsClient();
   const routes = await readRoutes(sheets);
-  const tarih = getTomorrowDateTR();
+  const tarih = resolveTargetDateTR();
   const sonKontrol = getNowTR();
 
   const browser = await chromium.launch({ headless: true });
@@ -726,7 +794,7 @@ async function main() {
 
   await browser.close();
 
-  await sendTelegramResultList(resultRows, sonKontrol);
+  await sendTelegramResultList(resultRows, sonKontrol, tarih);
 
   console.log("Tamamlandi.");
 }
