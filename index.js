@@ -50,36 +50,24 @@ function getTomorrowDateTR() {
 }
 
 function isValidDateString(value) {
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(value || ""))) {
-    return false;
-  }
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(value || ""))) return false;
 
   const d = new Date(`${value}T00:00:00`);
   if (Number.isNaN(d.getTime())) return false;
 
   const [y, m, day] = String(value).split("-").map(Number);
 
-  return (
-    d.getFullYear() === y &&
-    d.getMonth() + 1 === m &&
-    d.getDate() === day
-  );
+  return d.getFullYear() === y && d.getMonth() + 1 === m && d.getDate() === day;
 }
 
 function resolveTargetDateTR() {
   const manual = String(TARGET_DATE || "").trim();
-
-  if (manual && isValidDateString(manual)) {
-    return manual;
-  }
-
+  if (manual && isValidDateString(manual)) return manual;
   return getTomorrowDateTR();
 }
 
 function getNowTR() {
-  return new Date().toLocaleString("tr-TR", {
-    timeZone: "Europe/Istanbul"
-  });
+  return new Date().toLocaleString("tr-TR", { timeZone: "Europe/Istanbul" });
 }
 
 function randInt(min, max) {
@@ -154,13 +142,11 @@ async function readSortMode(sheets) {
       const key = String(row[0] || "").trim().toLowerCase();
       const value = String(row[1] || "").trim().toLowerCase();
 
-      if (key === "siralama") {
-        if (["firma", "sehir", "fiyat"].includes(value)) {
-          return value;
-        }
+      if (key === "siralama" && ["firma", "sehir", "fiyat"].includes(value)) {
+        return value;
       }
     }
-  } catch (e) {
+  } catch {
     console.log("Ayarlar sayfasi okunamadi, varsayilan siralama kullanilacak.");
   }
 
@@ -191,12 +177,7 @@ function normalizeJourneys(journeys) {
     if (seen.has(key)) continue;
     seen.add(key);
 
-    out.push({
-      company,
-      price,
-      departureRaw,
-      hour
-    });
+    out.push({ company, price, departureRaw, hour });
   }
 
   out.sort((a, b) => a.hour.localeCompare(b.hour));
@@ -283,25 +264,20 @@ async function hardResetPageState(page) {
     await page.evaluate(async () => {
       try { localStorage.clear(); } catch {}
       try { sessionStorage.clear(); } catch {}
-
       try {
         const keys = await caches.keys();
         await Promise.all(keys.map(k => caches.delete(k)));
       } catch {}
-
       try {
         if ("indexedDB" in window && indexedDB.databases) {
           const dbs = await indexedDB.databases();
           await Promise.all(
-            dbs
-              .map(db => db.name)
-              .filter(Boolean)
-              .map(name => new Promise((resolve) => {
-                const req = indexedDB.deleteDatabase(name);
-                req.onsuccess = () => resolve(true);
-                req.onerror = () => resolve(false);
-                req.onblocked = () => resolve(false);
-              }))
+            dbs.map(db => db.name).filter(Boolean).map(name => new Promise((resolve) => {
+              const req = indexedDB.deleteDatabase(name);
+              req.onsuccess = () => resolve(true);
+              req.onerror = () => resolve(false);
+              req.onblocked = () => resolve(false);
+            }))
           );
         }
       } catch {}
@@ -320,10 +296,7 @@ async function waitForJourneyJson(page, originId, destinationId, dateStr, timeou
   const json = await response.json();
   const journeys = Array.isArray(json.journeys) ? json.journeys : [];
 
-  return {
-    url: response.url(),
-    journeys
-  };
+  return { url: response.url(), journeys };
 }
 
 async function pageFetchJson(page, originId, destinationId, dateStr) {
@@ -341,12 +314,7 @@ async function pageFetchJson(page, originId, destinationId, dateStr) {
     });
 
     const text = await res.text();
-    return {
-      ok: res.ok,
-      status: res.status,
-      url: res.url,
-      text
-    };
+    return { ok: res.ok, status: res.status, url: res.url, text };
   }, { originId, destinationId, dateStr });
 }
 
@@ -366,12 +334,7 @@ async function fetchJourneysRobust(page, context, originId, destinationId, dateS
 
   try {
     const result = await waitJsonPromise;
-    return {
-      pageUrl,
-      jsonUrl: result.url,
-      journeys: result.journeys,
-      statusText: "OK"
-    };
+    return { pageUrl, jsonUrl: result.url, journeys: result.journeys, statusText: "OK" };
   } catch {
     logger("ilk response bekleme basarisiz, ekstra bekleme");
   }
@@ -380,12 +343,7 @@ async function fetchJourneysRobust(page, context, originId, destinationId, dateS
 
   try {
     const lateResult = await waitForJourneyJson(page, originId, destinationId, dateStr, 8000);
-    return {
-      pageUrl,
-      jsonUrl: lateResult.url,
-      journeys: lateResult.journeys,
-      statusText: "Gec geldi ama alindi"
-    };
+    return { pageUrl, jsonUrl: lateResult.url, journeys: lateResult.journeys, statusText: "Gec geldi ama alindi" };
   } catch {
     logger("gec response da gelmedi, sayfa ici fetch deneniyor");
   }
@@ -424,12 +382,7 @@ async function fetchJourneysRobust(page, context, originId, destinationId, dateS
 
     try {
       const retryResult = await retryWaitPromise;
-      return {
-        pageUrl,
-        jsonUrl: retryResult.url,
-        journeys: retryResult.journeys,
-        statusText: "Yeniden denemede alindi"
-      };
+      return { pageUrl, jsonUrl: retryResult.url, journeys: retryResult.journeys, statusText: "Yeniden denemede alindi" };
     } catch {
       logger("yeni sekmede response bekleme basarisiz, fetch tekrar deneniyor");
     }
@@ -450,12 +403,7 @@ async function fetchJourneysRobust(page, context, originId, destinationId, dateS
       });
 
       const text = await res.text();
-      return {
-        ok: res.ok,
-        status: res.status,
-        url: res.url,
-        text
-      };
+      return { ok: res.ok, status: res.status, url: res.url, text };
     }, { originId, destinationId, dateStr });
 
     if (retryFallback.ok) {
@@ -468,14 +416,8 @@ async function fetchJourneysRobust(page, context, originId, destinationId, dateS
       };
     }
 
-    if (retryFallback.status === 403) {
-      throw new Error("Engellendi | HTTP 403");
-    }
-
-    if (retryFallback.status === 404) {
-      throw new Error("Bulunamadi | HTTP 404");
-    }
-
+    if (retryFallback.status === 403) throw new Error("Engellendi | HTTP 403");
+    if (retryFallback.status === 404) throw new Error("Bulunamadi | HTTP 404");
     throw new Error(`JSON alinamadi | HTTP ${retryFallback.status}`);
   } finally {
     try { await retryPage.close(); } catch {}
@@ -506,44 +448,36 @@ function sortResultRows(rows, mode) {
     if (mode === "sehir") {
       const cityCmp = String(a[2]).localeCompare(String(b[2]), "tr");
       if (cityCmp !== 0) return cityCmp;
-
       const firmaCmp = String(a[0]).localeCompare(String(b[0]), "tr");
       if (firmaCmp !== 0) return firmaCmp;
-
       return String(a[4]).localeCompare(String(b[4]));
     }
 
     if (mode === "fiyat") {
       const fiyatCmp = Number(a[5]) - Number(b[5]);
       if (fiyatCmp !== 0) return fiyatCmp;
-
       const firmaCmp = String(a[0]).localeCompare(String(b[0]), "tr");
       if (firmaCmp !== 0) return firmaCmp;
-
       return String(a[4]).localeCompare(String(b[4]));
     }
 
     const firma = String(a[0]).localeCompare(String(b[0]), "tr");
     if (firma !== 0) return firma;
-
     const yon = String(a[1]).localeCompare(String(b[1]), "tr");
     if (yon !== 0) return yon;
-
     const guzergah = String(a[2]).localeCompare(String(b[2]), "tr");
     if (guzergah !== 0) return guzergah;
-
     return String(a[4]).localeCompare(String(b[4]));
   });
 }
 
-function isRetryableError(message) {
+function isRetryableError() {
   return true;
 }
 
 function parseCityFilterList(raw) {
   const text = String(raw || "").trim();
   if (!text) return [];
-
   return text
     .split(",")
     .map(x => x.trim())
@@ -560,15 +494,11 @@ function buildJobs(routes) {
   let jobIndex = 0;
 
   for (const route of routes) {
-    if (!route.aktif) {
-      continue;
-    }
+    if (!route.aktif) continue;
 
     if (useCityFilter) {
       const routeCity = String(route.varis || "").trim().toLocaleLowerCase("tr-TR");
-      if (!citySet.has(routeCity)) {
-        continue;
-      }
+      if (!citySet.has(routeCity)) continue;
     }
 
     if (!route.varis || !route.varisId || !Number.isFinite(route.referansFiyat) || route.referansFiyat <= 0) {
@@ -610,18 +540,8 @@ function groupRowsByCompany(rows) {
 
   for (const row of rows) {
     const [firma, yon, guzergah, tarih, saat, fiyat] = row;
-
-    if (!map.has(firma)) {
-      map.set(firma, []);
-    }
-
-    map.get(firma).push({
-      yon,
-      guzergah,
-      tarih,
-      saat,
-      fiyat
-    });
+    if (!map.has(firma)) map.set(firma, []);
+    map.get(firma).push({ yon, guzergah, tarih, saat, fiyat });
   }
 
   for (const [, items] of map) {
@@ -636,9 +556,7 @@ function groupRowsByCompany(rows) {
 }
 
 function splitLongTelegramText(text, maxLen = 3500) {
-  if (text.length <= maxLen) {
-    return [text];
-  }
+  if (text.length <= maxLen) return [text];
 
   const lines = text.split("\n");
   const out = [];
@@ -664,10 +582,7 @@ function splitLongTelegramText(text, maxLen = 3500) {
     }
   }
 
-  if (current) {
-    out.push(current);
-  }
-
+  if (current) out.push(current);
   return out;
 }
 
@@ -707,12 +622,7 @@ function buildTelegramMessages(resultRows, sonKontrol, tarih) {
 
 function prependTriggerInfo(messages) {
   const who = String(TRIGGER_USER_LABEL || "").trim() || `Chat ${TRIGGER_CHAT_ID || "-"}`;
-  return messages.map((msg, i) => {
-    if (i === 0) {
-      return `Baslatan: ${who}\n\n${msg}`;
-    }
-    return msg;
-  });
+  return messages.map((msg, i) => i === 0 ? `Baslatan: ${who}\n\n${msg}` : msg);
 }
 
 async function sendTelegramMessageTo(chatId, text) {
@@ -723,13 +633,8 @@ async function sendTelegramMessageTo(chatId, text) {
 
   const res = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify({
-      chat_id: chatId,
-      text
-    })
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ chat_id: chatId, text })
   });
 
   if (!res.ok) {
@@ -743,14 +648,8 @@ async function sendTelegramResultList(resultRows, sonKontrol, tarih) {
   messages = prependTriggerInfo(messages);
 
   const targets = new Set();
-
-  if (TRIGGER_CHAT_ID) {
-    targets.add(String(TRIGGER_CHAT_ID));
-  }
-
-  if (TELEGRAM_CHAT_ID) {
-    targets.add(String(TELEGRAM_CHAT_ID));
-  }
+  if (TRIGGER_CHAT_ID) targets.add(String(TRIGGER_CHAT_ID));
+  if (TELEGRAM_CHAT_ID) targets.add(String(TELEGRAM_CHAT_ID));
 
   for (const target of targets) {
     for (const msg of messages) {
@@ -909,7 +808,7 @@ async function main() {
       const message = String(err.message || err);
       await setDebug(`Hata | ${message}`, 0);
 
-      if (pass === 1 && isRetryableError(message)) {
+      if (pass === 1 && isRetryableError()) {
         failedForSecondPass.push({ ...job, pass: 2 });
       }
     }
@@ -939,13 +838,10 @@ async function main() {
       }
     }
 
-    await Promise.all(
-      Array.from({ length: CONCURRENCY }, (_, i) => worker(i))
-    );
+    await Promise.all(Array.from({ length: CONCURRENCY }, (_, i) => worker(i)));
   }
 
   await queueSync(true);
-
   await runPass(jobs);
 
   if (failedForSecondPass.length > 0) {
