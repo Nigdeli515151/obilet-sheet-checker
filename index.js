@@ -11,6 +11,8 @@ const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 const TARGET_DATE = process.env.TARGET_DATE;
 const TARGET_CITY = process.env.TARGET_CITY;
+const TRIGGER_CHAT_ID = process.env.TRIGGER_CHAT_ID;
+const TRIGGER_USER_LABEL = process.env.TRIGGER_USER_LABEL;
 
 const NIGDE_ID = 398;
 const NIGDE_NAME = "Niğde";
@@ -538,8 +540,22 @@ function isRetryableError(message) {
   return true;
 }
 
+function parseCityFilterList(raw) {
+  const text = String(raw || "").trim();
+  if (!text) return [];
+
+  return text
+    .split(",")
+    .map(x => x.trim())
+    .filter(Boolean)
+    .map(x => x.toLocaleLowerCase("tr-TR"));
+}
+
 function buildJobs(routes) {
-  const cityFilter = String(TARGET_CITY || "").trim().toLocaleLowerCase("tr-TR");
+  const cityFilterList = parseCityFilterList(TARGET_CITY);
+  const useCityFilter = cityFilterList.length > 0;
+  const citySet = new Set(cityFilterList);
+
   const jobs = [];
   let jobIndex = 0;
 
@@ -548,9 +564,9 @@ function buildJobs(routes) {
       continue;
     }
 
-    if (cityFilter) {
+    if (useCityFilter) {
       const routeCity = String(route.varis || "").trim().toLocaleLowerCase("tr-TR");
-      if (routeCity !== cityFilter) {
+      if (!citySet.has(routeCity)) {
         continue;
       }
     }
@@ -656,17 +672,16 @@ function splitLongTelegramText(text, maxLen = 3500) {
 }
 
 function buildTelegramMessages(resultRows, sonKontrol, tarih) {
+  const cityText = TARGET_CITY ? `\nSehir(ler): ${TARGET_CITY}` : "";
+
   if (!resultRows.length) {
-    const cityText = TARGET_CITY ? `\nSehir: ${TARGET_CITY}` : "";
     return [`Kontrol bitti.\nTarih: ${tarih}${cityText}\nUygun fiyat bulunamadi.\nSon kontrol: ${sonKontrol}`];
   }
 
   const grouped = groupRowsByCompany(resultRows);
   const messages = [];
 
-  let current = `Kontrol bitti.\nTarih: ${tarih}\n`;
-  if (TARGET_CITY) current += `Sehir: ${TARGET_CITY}\n`;
-  current += `Son kontrol: ${sonKontrol}\n`;
+  let current = `Kontrol bitti.\nTarih: ${tarih}${cityText}\nSon kontrol: ${sonKontrol}\n`;
 
   for (const [firma, items] of grouped.entries()) {
     let section = `\n${firma}\n`;
@@ -690,8 +705,18 @@ function buildTelegramMessages(resultRows, sonKontrol, tarih) {
   return messages;
 }
 
-async function sendTelegramMessage(text) {
-  if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
+function prependTriggerInfo(messages) {
+  const who = String(TRIGGER_USER_LABEL || "").trim() || `Chat ${TRIGGER_CHAT_ID || "-"}`;
+  return messages.map((msg, i) => {
+    if (i === 0) {
+      return `Baslatan: ${who}\n\n${msg}`;
+    }
+    return msg;
+  });
+}
+
+async function sendTelegramMessageTo(chatId, text) {
+  if (!TELEGRAM_BOT_TOKEN || !chatId) {
     console.log("Telegram bilgileri eksik, mesaj gonderilmedi.");
     return;
   }
@@ -702,7 +727,7 @@ async function sendTelegramMessage(text) {
       "Content-Type": "application/json"
     },
     body: JSON.stringify({
-      chat_id: TELEGRAM_CHAT_ID,
+      chat_id: chatId,
       text
     })
   });
@@ -714,10 +739,23 @@ async function sendTelegramMessage(text) {
 }
 
 async function sendTelegramResultList(resultRows, sonKontrol, tarih) {
-  const messages = buildTelegramMessages(resultRows, sonKontrol, tarih);
+  let messages = buildTelegramMessages(resultRows, sonKontrol, tarih);
+  messages = prependTriggerInfo(messages);
 
-  for (const msg of messages) {
-    await sendTelegramMessage(msg);
+  const targets = new Set();
+
+  if (TRIGGER_CHAT_ID) {
+    targets.add(String(TRIGGER_CHAT_ID));
+  }
+
+  if (TELEGRAM_CHAT_ID) {
+    targets.add(String(TELEGRAM_CHAT_ID));
+  }
+
+  for (const target of targets) {
+    for (const msg of messages) {
+      await sendTelegramMessageTo(target, msg);
+    }
   }
 }
 
