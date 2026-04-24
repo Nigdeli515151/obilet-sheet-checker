@@ -7,6 +7,10 @@ on:
         description: "Istenen tarih (YYYY-MM-DD). Bos birakilirsa yarin kullanilir."
         required: false
         type: string
+      target_city:
+        description: "Sadece bu sehri calistir. Bos birakilirsa tum aktifler."
+        required: false
+        type: string
 
 concurrency:
   group: obilet-sheet-check
@@ -38,4 +42,5 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           TARGET_DATE: ${{ github.event.inputs.target_date }}
+          TARGET_CITY: ${{ github.event.inputs.target_city }}
         run: npm start
