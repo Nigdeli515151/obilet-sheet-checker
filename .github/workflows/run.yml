@@ -8,7 +8,15 @@ on:
         required: false
         type: string
       target_city:
-        description: "Sadece bu sehri calistir. Bos birakilirsa tum aktifler."
+        description: "Virgulle ayrilmis sehir listesi. Bos birakilirsa tum aktifler."
+        required: false
+        type: string
+      trigger_chat_id:
+        description: "Komutu calistiran Telegram chat id"
+        required: false
+        type: string
+      trigger_user_label:
+        description: "Komutu calistiran kullanici bilgisi"
         required: false
         type: string
 
@@ -43,4 +51,6 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           TARGET_DATE: ${{ github.event.inputs.target_date }}
           TARGET_CITY: ${{ github.event.inputs.target_city }}
+          TRIGGER_CHAT_ID: ${{ github.event.inputs.trigger_chat_id }}
+          TRIGGER_USER_LABEL: ${{ github.event.inputs.trigger_user_label }}
         run: npm start
