@@ -5,10 +5,12 @@ const SHEET_ID = process.env.SHEET_ID;
 const SHEET_INPUT_NAME = "Guzergahlar";
 const SHEET_OUTPUT_NAME = "Farkli_Fiyatlar";
 const SHEET_DEBUG_NAME = "Debug";
+const SHEET_SETTINGS_NAME = "Ayarlar";
 
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 const TARGET_DATE = process.env.TARGET_DATE;
+const TARGET_CITY = process.env.TARGET_CITY;
 
 const NIGDE_ID = 398;
 const NIGDE_NAME = "Niğde";
@@ -51,9 +53,7 @@ function isValidDateString(value) {
   }
 
   const d = new Date(`${value}T00:00:00`);
-  if (Number.isNaN(d.getTime())) {
-    return false;
-  }
+  if (Number.isNaN(d.getTime())) return false;
 
   const [y, m, day] = String(value).split("-").map(Number);
 
@@ -140,6 +140,31 @@ async function readRoutes(sheets) {
   });
 }
 
+async function readSortMode(sheets) {
+  try {
+    const res = await sheets.spreadsheets.values.get({
+      spreadsheetId: SHEET_ID,
+      range: `${SHEET_SETTINGS_NAME}!A:B`
+    });
+
+    const rows = res.data.values || [];
+    for (const row of rows) {
+      const key = String(row[0] || "").trim().toLowerCase();
+      const value = String(row[1] || "").trim().toLowerCase();
+
+      if (key === "siralama") {
+        if (["firma", "sehir", "fiyat"].includes(value)) {
+          return value;
+        }
+      }
+    }
+  } catch (e) {
+    console.log("Ayarlar sayfasi okunamadi, varsayilan siralama kullanilacak.");
+  }
+
+  return "firma";
+}
+
 function formatHour(value) {
   if (!value) return "";
   const s = String(value);
@@ -193,22 +218,43 @@ async function clearAndWriteRange(sheets, range, values) {
 async function createContextAndPage(browser, workerId) {
   const context = await browser.newContext({
     locale: "tr-TR",
-    userAgent: USER_AGENTS[workerId % USER_AGENTS.length]
+    userAgent: USER_AGENTS[workerId % USER_AGENTS.length],
+    serviceWorkers: "block"
   });
 
   const page = await context.newPage();
   page.setDefaultTimeout(PAGE_TIMEOUT_MS);
 
+  await page.setExtraHTTPHeaders({
+    "Cache-Control": "no-cache, no-store, must-revalidate",
+    "Pragma": "no-cache",
+    "Expires": "0"
+  });
+
   await page.route("**/*", async (route) => {
-    const type = route.request().resourceType();
+    const req = route.request();
+    const type = req.resourceType();
+
     if (type === "image" || type === "font" || type === "media") {
       await route.abort();
       return;
     }
-    await route.continue();
+
+    const headers = {
+      ...req.headers(),
+      "cache-control": "no-cache, no-store, must-revalidate",
+      "pragma": "no-cache",
+      "expires": "0"
+    };
+
+    await route.continue({ headers });
   });
 
-  return { context, page };
+  const cdp = await context.newCDPSession(page);
+  await cdp.send("Network.enable");
+  await cdp.send("Network.setCacheDisabled", { cacheDisabled: true });
+
+  return { context, page, cdp };
 }
 
 async function rotateWorkerResources(browser, workerState, workerId) {
@@ -222,7 +268,43 @@ async function rotateWorkerResources(browser, workerState, workerId) {
   const fresh = await createContextAndPage(browser, workerId);
   workerState.context = fresh.context;
   workerState.page = fresh.page;
+  workerState.cdp = fresh.cdp;
   workerState.jobsSinceRotate = 0;
+}
+
+async function hardResetPageState(page) {
+  try {
+    await page.goto("about:blank", { waitUntil: "load", timeout: 10000 });
+  } catch {}
+
+  try {
+    await page.evaluate(async () => {
+      try { localStorage.clear(); } catch {}
+      try { sessionStorage.clear(); } catch {}
+
+      try {
+        const keys = await caches.keys();
+        await Promise.all(keys.map(k => caches.delete(k)));
+      } catch {}
+
+      try {
+        if ("indexedDB" in window && indexedDB.databases) {
+          const dbs = await indexedDB.databases();
+          await Promise.all(
+            dbs
+              .map(db => db.name)
+              .filter(Boolean)
+              .map(name => new Promise((resolve) => {
+                const req = indexedDB.deleteDatabase(name);
+                req.onsuccess = () => resolve(true);
+                req.onerror = () => resolve(false);
+                req.onblocked = () => resolve(false);
+              }))
+          );
+        }
+      } catch {}
+    });
+  } catch {}
 }
 
 async function waitForJourneyJson(page, originId, destinationId, dateStr, timeoutMs) {
@@ -248,9 +330,12 @@ async function pageFetchJson(page, originId, destinationId, dateStr) {
     const res = await fetch(url, {
       method: "GET",
       headers: {
-        "accept": "application/json, text/plain, */*"
+        "accept": "application/json, text/plain, */*",
+        "cache-control": "no-cache, no-store, must-revalidate",
+        "pragma": "no-cache"
       },
-      credentials: "include"
+      credentials: "include",
+      cache: "no-store"
     });
 
     const text = await res.text();
@@ -264,7 +349,10 @@ async function pageFetchJson(page, originId, destinationId, dateStr) {
 }
 
 async function fetchJourneysRobust(page, context, originId, destinationId, dateStr, logger) {
-  const pageUrl = `https://www.obilet.com/seferler/${originId}-${destinationId}/${dateStr}`;
+  const cacheBust = `cb=${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  const pageUrl = `https://www.obilet.com/seferler/${originId}-${destinationId}/${dateStr}?${cacheBust}`;
+
+  await hardResetPageState(page);
 
   logger("sayfa aciliyor");
   const waitJsonPromise = waitForJourneyJson(page, originId, destinationId, dateStr, RESPONSE_TIMEOUT_MS);
@@ -317,7 +405,15 @@ async function fetchJourneysRobust(page, context, originId, destinationId, dateS
   const retryPage = await context.newPage();
   retryPage.setDefaultTimeout(PAGE_TIMEOUT_MS);
 
+  await retryPage.setExtraHTTPHeaders({
+    "Cache-Control": "no-cache, no-store, must-revalidate",
+    "Pragma": "no-cache",
+    "Expires": "0"
+  });
+
   try {
+    await hardResetPageState(retryPage);
+
     const retryWaitPromise = waitForJourneyJson(retryPage, originId, destinationId, dateStr, RESPONSE_TIMEOUT_MS);
     await retryPage.goto(pageUrl, {
       waitUntil: "domcontentloaded",
@@ -338,7 +434,27 @@ async function fetchJourneysRobust(page, context, originId, destinationId, dateS
 
     await retryPage.waitForTimeout(5000);
 
-    const retryFallback = await pageFetchJson(retryPage, originId, destinationId, dateStr);
+    const retryFallback = await retryPage.evaluate(async ({ originId, destinationId, dateStr }) => {
+      const url = `/json/journeys/${originId}-${destinationId}/${dateStr}`;
+      const res = await fetch(url, {
+        method: "GET",
+        headers: {
+          "accept": "application/json, text/plain, */*",
+          "cache-control": "no-cache, no-store, must-revalidate",
+          "pragma": "no-cache"
+        },
+        credentials: "include",
+        cache: "no-store"
+      });
+
+      const text = await res.text();
+      return {
+        ok: res.ok,
+        status: res.status,
+        url: res.url,
+        text
+      };
+    }, { originId, destinationId, dateStr });
 
     if (retryFallback.ok) {
       const retryParsed = JSON.parse(retryFallback.text);
@@ -383,8 +499,28 @@ async function fetchJourneysWithRetry(page, context, originId, destinationId, da
   throw lastError || new Error("Bilinmeyen hata");
 }
 
-function sortResultRows(rows) {
+function sortResultRows(rows, mode) {
   rows.sort((a, b) => {
+    if (mode === "sehir") {
+      const cityCmp = String(a[2]).localeCompare(String(b[2]), "tr");
+      if (cityCmp !== 0) return cityCmp;
+
+      const firmaCmp = String(a[0]).localeCompare(String(b[0]), "tr");
+      if (firmaCmp !== 0) return firmaCmp;
+
+      return String(a[4]).localeCompare(String(b[4]));
+    }
+
+    if (mode === "fiyat") {
+      const fiyatCmp = Number(a[5]) - Number(b[5]);
+      if (fiyatCmp !== 0) return fiyatCmp;
+
+      const firmaCmp = String(a[0]).localeCompare(String(b[0]), "tr");
+      if (firmaCmp !== 0) return firmaCmp;
+
+      return String(a[4]).localeCompare(String(b[4]));
+    }
+
     const firma = String(a[0]).localeCompare(String(b[0]), "tr");
     if (firma !== 0) return firma;
 
@@ -403,12 +539,20 @@ function isRetryableError(message) {
 }
 
 function buildJobs(routes) {
+  const cityFilter = String(TARGET_CITY || "").trim().toLocaleLowerCase("tr-TR");
   const jobs = [];
   let jobIndex = 0;
 
   for (const route of routes) {
     if (!route.aktif) {
       continue;
+    }
+
+    if (cityFilter) {
+      const routeCity = String(route.varis || "").trim().toLocaleLowerCase("tr-TR");
+      if (routeCity !== cityFilter) {
+        continue;
+      }
     }
 
     if (!route.varis || !route.varisId || !Number.isFinite(route.referansFiyat) || route.referansFiyat <= 0) {
@@ -492,7 +636,6 @@ function splitLongTelegramText(text, maxLen = 3500) {
         out.push(current);
         current = line;
       } else {
-        // tek satır çok uzunsa sert böl
         let start = 0;
         while (start < line.length) {
           out.push(line.slice(start, start + maxLen));
@@ -514,13 +657,16 @@ function splitLongTelegramText(text, maxLen = 3500) {
 
 function buildTelegramMessages(resultRows, sonKontrol, tarih) {
   if (!resultRows.length) {
-    return [`Kontrol bitti.\nTarih: ${tarih}\nUygun fiyat bulunamadi.\nSon kontrol: ${sonKontrol}`];
+    const cityText = TARGET_CITY ? `\nSehir: ${TARGET_CITY}` : "";
+    return [`Kontrol bitti.\nTarih: ${tarih}${cityText}\nUygun fiyat bulunamadi.\nSon kontrol: ${sonKontrol}`];
   }
 
   const grouped = groupRowsByCompany(resultRows);
   const messages = [];
 
-  let current = `Kontrol bitti.\nTarih: ${tarih}\nSon kontrol: ${sonKontrol}\n`;
+  let current = `Kontrol bitti.\nTarih: ${tarih}\n`;
+  if (TARGET_CITY) current += `Sehir: ${TARGET_CITY}\n`;
+  current += `Son kontrol: ${sonKontrol}\n`;
 
   for (const [firma, items] of grouped.entries()) {
     let section = `\n${firma}\n`;
@@ -580,6 +726,7 @@ async function main() {
 
   const sheets = await getSheetsClient();
   const routes = await readRoutes(sheets);
+  const sortMode = await readSortMode(sheets);
   const tarih = resolveTargetDateTR();
   const sonKontrol = getNowTR();
 
@@ -590,6 +737,7 @@ async function main() {
     workerStates.push({
       context: null,
       page: null,
+      cdp: null,
       jobsSinceRotate: 0
     });
     await rotateWorkerResources(browser, workerStates[i], i);
@@ -717,7 +865,7 @@ async function main() {
         }
       }
 
-      sortResultRows(resultRows);
+      sortResultRows(resultRows, sortMode);
       await queueSync(false);
     } catch (err) {
       const message = String(err.message || err);
